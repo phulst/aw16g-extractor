@@ -1,0 +1,116 @@
+# aw16g-extractor
+
+Extract audio tracks from Yamaha AW-16G `.16G` backup files as WAV.
+
+A small, single-file Python 3 script for recovering audio from the proprietary
+backup format the Yamaha AW-16G Professional Audio Workstation writes to CD.
+No dependencies — standard library only.
+
+## Why this exists
+
+The only public extractor for these files is
+[AWare-Audio](https://github.com/jeffleary00/AWare-Audio) by Jeff Leary
+(SillyMonkey Software), a Tcl/Tk tool first written for the AW4416/AW2816 and
+later extended to the AW16G. The format constants and walking strategy used
+here come from that project. Without it this script wouldn't exist — go give
+it a star.
+
+However, the AW16G code path in AWare-Audio crashes on real-world backups
+because of two bugs:
+
+1. It assumes user songs occupy *consecutive* entries in the AW16G's
+   1000-entry song-info table, starting at the entry whose `offset` field is
+   zero. In practice user songs are sparsely scattered among that table
+   (which also contains factory presets and stale slots), so the second and
+   third "songs" the tool picks up are usually junk.
+2. There's no bounds check on the final song-block location, so those junk
+   entries produce seeks past EOF and the next `binary scan` crashes with
+   `can't use empty string as operand of "&"`.
+
+This script scans the whole table and keeps entries whose computed song-block
+start (a) lies inside the file and (b) contains plausible `V_TR01_1` track
+headers, which sidesteps both issues.
+
+## Requirements
+
+- Python 3.x. Standard library only.
+
+## Usage
+
+```sh
+python3 extract_aw16g.py <path-to-.16G-file> [output-directory]
+```
+
+Output directory defaults to `./extracted`.
+
+Example:
+
+```sh
+$ python3 extract_aw16g.py AW_00000.16G
+Disk header: signature=b'CFS 3.00'  disk_number=0  songcount=3
+Found 3 song(s) with data in this file (songcount header says 3)
+
+>> Song 'Just a girl' at 0x00515800
+   9 valid track(s)
+   wrote 000_V_TR01_1.wav               18,339,264 samples  ( 415.86s)
+   wrote 008_V_TR02_1.wav               18,419,236 samples  ( 417.67s)
+   ...
+```
+
+## Output
+
+```
+extracted/
+  <song name>/
+    000_V_TR01_1.wav      <- main track 1, virtual take 1
+    008_V_TR02_1.wav      <- main track 2, virtual take 1
+    009_V_TR02_2.wav      <- main track 2, virtual take 2
+    ...
+```
+
+Files are mono, 16-bit signed PCM, 44.1 kHz — the AW16G's only audio format.
+The numeric prefix is the track's slot index (tracks 1–16 occupy slots 0, 8,
+16, 24, …, 120; virtual takes 2–8 of each track occupy the slots in between).
+Empty / unused virtual takes are skipped.
+
+## Loading the WAVs into a DAW
+
+Logic Pro and GarageBand: drag the song folder onto the tracks area. The DAW
+creates one track per WAV, all aligned to the project start — which is what
+you want, since every AW16G region in a song shares a common timeline anchored
+at sample 0.
+
+## Multi-disk backups
+
+CD-spanning backups produce a numbered sequence (`AW_00000.16G`,
+`AW_00001.16G`, …). This script reads only the file you point it at. When a
+song's audio frames reference data past EOF, you'll see:
+
+```
+skip  000_V_TR01_1.wav  (no audio on this disk)  [TRUNCATED -- needs next disk]
+```
+
+The song's *metadata* (name, tracks, region pointers) is recovered, but the
+audio itself lives on a later disk. Multi-disk support would need a small
+extension to follow frame numbers across files. PRs welcome.
+
+## Limitations
+
+- Single-disk only (see above).
+- No 24-bit support. The AW-16G is a 16-bit machine; the related AW4416 /
+  AW2816 can do 24-bit but those models aren't handled here — use
+  AWare-Audio for those.
+- Loads the song-info table into memory (~128 KB) but otherwise streams.
+
+## Credits
+
+- **[AWare-Audio](https://github.com/jeffleary00/AWare-Audio)** by Jeff Leary
+  — the source of all the format constants and the original walking
+  algorithm. This project is essentially a Python reimplementation with two
+  bugs fixed.
+
+## License
+
+BSD 2-Clause. See [LICENSE](LICENSE). The format-constant block and the
+song/track/region/map walking strategy are derived from AWare-Audio, which is
+also BSD-2-Clause.

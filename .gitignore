@@ -1,0 +1,27 @@
+# AW16G backup files — these are user data, not source
+*.16G
+*.CFS
+
+# Default extractor output
+/extracted/
+
+# Locally cloned reference (the upstream project that informed this one)
+/AWare-Audio/
+
+# Claude Code session state
+/.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
