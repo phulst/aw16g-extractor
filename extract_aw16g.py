@@ -206,44 +206,107 @@ def open_disks(first_path):
     return disks
 
 
-def find_frame_on_disks(disks, global_frame):
-    """Locate the (disk, file_offset) for a global audio-frame number, or
-    None if no disk in the set holds that frame."""
+def find_frame_on_disks(disks, global_frame, extent=BLOCK_SIZE):
+    """Locate the (disk, file_offset) for a global frame number (used for
+    both audio frames and song-metadata blocks, which live in the same
+    address space). Returns None if no disk in the set holds that frame, or
+    if `extent` bytes from the resolved offset would run past the disk's EOF.
+
+    Routing rule per disk:
+        adj = global_frame + (offset_frames - 1) if previous_frames == -1
+              global_frame                       otherwise (disk 0)
+        valid on this disk iff 0 <= adj < max_frames
+        file offset = audio_base + adj * BLOCK_SIZE
+
+    The "-1" on disks with previous_frames==-1 is empirical: the disk-info
+    header stores an `offset_frames` that's one off from the actual shift
+    needed to align song-metadata blocks (and audio frames) across disks.
+    Verified against song-block locations on a 4-disk backup where the
+    songinfo offset_blocks values 5626/8624/11325/15309/20327 line up
+    exactly with the local frame numbers 46/3044/125/4109/3507 on disks
+    1/1/2/2/3."""
     for d in disks:
-        adj = global_frame + (d["offset_frames"] if d["previous_frames"] == -1 else 0)
+        if d["previous_frames"] == -1:
+            adj = global_frame + d["offset_frames"] - 1
+        else:
+            adj = global_frame
         if 0 <= adj < d["max_frames"]:
             off = d["audio_base"] + adj * BLOCK_SIZE
-            if off + BLOCK_SIZE <= d["size"]:
+            if off + extent <= d["size"]:
                 return d, off
     return None
 
 
-def find_songs(fh, file_size, expected_count):
-    """Walk the 1000-entry songinfo table; keep entries whose computed
-    song-block start is inside the file and has plausible track data."""
-    raw = read_at(fh, SONGINFO_LOCATION, SONGINFO_MAX_COUNT * SONGINFO_SIZE)
+def looks_like_song(fh, song_loc):
+    """Plausibility check for a song-metadata block. Requires:
+
+      - Track 0's name is non-empty printable ASCII (8-byte field, possibly
+        null-padded). On the AW-16G this is the default 'V_TR01_1' or a
+        user-renamed string. For stale-slot locations the trackinfo area is
+        usually raw audio samples and the chance of 8 consecutive printable
+        bytes is ~0.04%.
+      - At least one of the 128 track-info entries has a valid region
+        pointer (< 0xFFFF).
+      - Not ALL 128 entries pass the region-pointer check. A real song has
+        many 0xFFFF entries (unrecorded virtual takes); a stale slot whose
+        random data happens to satisfy the name check is also overwhelmingly
+        likely to have all 128 region_ptrs < 0xFFFF (~99.997% per slot).
+    """
+    raw = read_at(fh, song_loc + TRACKINFO_OFFSET, TRACKINFO_MAX_COUNT * TRACKINFO_SIZE)
+    if len(raw) < TRACKINFO_MAX_COUNT * TRACKINFO_SIZE:
+        return False
+    name0 = raw[TRACKINFO_NAME_OFFSET:TRACKINFO_NAME_OFFSET+TRACKINFO_NAME_SIZE]
+    trimmed = name0.rstrip(b"\x00")
+    if not trimmed or not all(32 <= c < 127 for c in trimmed):
+        return False
+    valid_regions = sum(
+        1
+        for i in range(TRACKINFO_MAX_COUNT)
+        if u16(raw, i * TRACKINFO_SIZE + TRACKINFO_REGION_OFFSET) < BLOCK_TERM
+    )
+    return 1 <= valid_regions < TRACKINFO_MAX_COUNT
+
+
+def find_songs(disks, expected_count):
+    """Walk the 1000-entry songinfo table on disk 0. For each non-empty entry,
+    route the song's metadata block (offset_blocks) to whichever disk holds
+    it; songs that fail the route are listed as 'skipped' (their data lives
+    on a disk we don't have). Songs that route to a disk but fail the
+    track-info plausibility check are silently dropped (stale slots)."""
+    fh0 = disks[0]["fh"]
+    raw = read_at(fh0, SONGINFO_LOCATION, SONGINFO_MAX_COUNT * SONGINFO_SIZE)
     songs = []
+    skipped = []
     for i in range(SONGINFO_MAX_COUNT):
         block = raw[i*SONGINFO_SIZE:(i+1)*SONGINFO_SIZE]
         name_raw = block[SONGINFO_NAME_OFFSET:SONGINFO_NAME_OFFSET+SONGINFO_NAME_SIZE]
-        # skip empty slots
         if not name_raw.replace(b"\x00", b"").strip():
             continue
         offset_blocks = u32(block, SONGINFO_OFFSET_OFFSET)
-        song_loc = offset_blocks * BLOCK_SIZE + SONGBLOCK_LOCATION
-        if song_loc + SONGBLOCK_SIZE > file_size:
-            continue                                       # data lives on another disk
-        # plausibility check: track 0's name field should look like V_TR01_1
-        head = read_at(fh, song_loc + TRACKINFO_OFFSET, 8)
-        if not head.startswith(b"V_TR"):
+        located = find_frame_on_disks(disks, offset_blocks, extent=SONGBLOCK_SIZE)
+        if located is None:
+            skipped.append((i, clean_name(name_raw), offset_blocks))
+            continue
+        disk, song_loc = located
+        if not looks_like_song(disk["fh"], song_loc):
             continue
         songs.append({
             "songinfo_index": i,
             "name": clean_name(name_raw),
+            "disk": disk,
             "location": song_loc,
             "offset_blocks": offset_blocks,
         })
-    print(f"Found {len(songs)} song(s) with data in this file " +
+    if skipped:
+        print(f"\nNote: {len(skipped)} song-info entr{'y' if len(skipped)==1 else 'ies'} "
+              "point past the disks we have (likely stale/old entries from "
+              "previous backups):")
+        for i, name, ob in skipped[:8]:
+            print(f"  - {name!r} (songinfo idx {i}, offset_blocks=0x{ob:x})")
+        if len(skipped) > 8:
+            print(f"  ... and {len(skipped) - 8} more")
+        print()
+    print(f"Found {len(songs)} song(s) " +
           (f"(songcount header says {expected_count})" if expected_count is not None else ""))
     return songs
 
@@ -285,15 +348,16 @@ def read_map_entry(fh, song_loc, map_id):
     }
 
 
-def extract_track_pcm(disks, song_loc, track):
+def extract_track_pcm(disks, song, track):
     """Walk a track's region list and frame map. Returns (pcm_le_bytes,
     truncated). truncated is True if any audio frame referenced by this track
     is not present on any of the disks we have.
 
-    `disks` is a list of disk dicts from open_disks(). Metadata (regions,
-    maps) is read from disks[0]; audio frames are routed to the disk that
-    holds them via find_frame_on_disks()."""
-    fh0 = disks[0]["fh"]
+    Metadata (regions, maps) is read from the disk that holds this song's
+    metadata block (song["disk"]). Audio frames are routed independently via
+    find_frame_on_disks(), since they can live on different disks."""
+    meta_fh = song["disk"]["fh"]
+    song_loc = song["location"]
     bits = 16
     sample_bytes = bits // 8
     out = bytearray()
@@ -302,7 +366,7 @@ def extract_track_pcm(disks, song_loc, track):
 
     region_ptr = track["region_ptr"]
     while region_ptr < BLOCK_TERM:
-        region = read_region(fh0, song_loc, region_ptr)
+        region = read_region(meta_fh, song_loc, region_ptr)
         if region["total_samples"] == 0 or region["start_sample"] < 0:
             region_ptr = region["next_region"]
             continue
@@ -324,7 +388,7 @@ def extract_track_pcm(disks, song_loc, track):
         first_frame = True
         map_ptr = region["map_ptr"]
         while map_ptr < BLOCK_TERM:
-            entry = read_map_entry(fh0, song_loc, map_ptr)
+            entry = read_map_entry(meta_fh, song_loc, map_ptr)
             audio_frame = entry["audio_frame"]
             is_last_frame_in_region = entry["next_map"] >= BLOCK_TERM
 
@@ -409,7 +473,7 @@ def main():
 
     try:
         songcount, _ = parse_disk_header(fh0, sz0)
-        songs = find_songs(fh0, sz0, songcount)
+        songs = find_songs(disks, songcount)
 
         any_missing = False
         used_dirs_lower = set()
@@ -426,15 +490,16 @@ def main():
             used_dirs_lower.add(candidate.lower())
             song_dir = os.path.join(out_dir, candidate)
             os.makedirs(song_dir, exist_ok=True)
+            loc_label = f"disk {song['disk']['disknum']} @ 0x{song['location']:08x}"
             if candidate != base:
-                print(f"\n>> Song '{song['name']}' at 0x{song['location']:08x}  -> {candidate!r} (name collision)")
+                print(f"\n>> Song '{song['name']}' ({loc_label})  -> {candidate!r} (name collision)")
             else:
-                print(f"\n>> Song '{song['name']}' at 0x{song['location']:08x}")
-            tracks = parse_tracks(fh0, song["location"])
+                print(f"\n>> Song '{song['name']}' ({loc_label})")
+            tracks = parse_tracks(song["disk"]["fh"], song["location"])
             print(f"   {len(tracks)} valid track(s)")
             song_truncated = False
             for tr in tracks:
-                pcm, truncated = extract_track_pcm(disks, song["location"], tr)
+                pcm, truncated = extract_track_pcm(disks, song, tr)
                 samples = len(pcm) // 2
                 secs = samples / 44100
                 fname = f"{tr['index']:03d}_{tr['name']}.wav"
