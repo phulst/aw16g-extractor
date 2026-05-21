@@ -157,12 +157,16 @@ def open_disks(first_path):
     """Open the given .16G plus any sibling disks (incrementing numeric suffix).
     Returns a list of disk dicts in [disk 0, disk 1, ...] order.
 
-    The AW-16G names backup files like AW_00000.16G, AW_00001.16G, ... so we
-    look for the numeric suffix in the input filename and probe for siblings
-    with each integer incremented. macOS case-insensitivity is handled by
-    trying a few common case variants."""
+    The AW-16G names backup files like AW_00000.16G, AW_00001.16G, ... but
+    users sometimes rename them (e.g. "anna_1.16g", "anna_2.16g"). We extract
+    the trailing numeric suffix from the input filename and probe for siblings
+    with that integer incremented — so the numeric suffix in the filename
+    doesn't have to match the disknum field inside the file. macOS
+    case-insensitivity is handled by trying common case variants."""
     disks = [open_disk_file(first_path)]
     if disks[0]["disknum"] != 0:
+        print(f"Note: {first_path} reports disknum={disks[0]['disknum']}, not 0; only this file will be read.\n"
+              f"      For multi-disk extraction, point the script at the first (disknum=0) file.\n")
         return disks
     dirname  = os.path.dirname(first_path) or "."
     basename = os.path.basename(first_path)
@@ -171,23 +175,34 @@ def open_disks(first_path):
     if not m:
         return disks
     prefix, digits = name[:m.start()], m.end() - m.start()
-    idx = 1
+    # Sibling search starts at the suffix found in the input filename + 1, so
+    # we never re-open the same file as disk 0.
+    fname_idx = int(m.group(1)) + 1
+    first_path_abs = os.path.abspath(first_path)
     while True:
-        cand_name = f"{prefix}{idx:0{digits}d}{ext}"
-        variants = {cand_name, cand_name.upper(), cand_name.lower()}
+        cand_name = f"{prefix}{fname_idx:0{digits}d}{ext}"
+        # Try the natural case first, then upper / lower as fallbacks. Using
+        # a list rather than a set keeps the probe order deterministic.
+        seen = set()
+        variants = []
+        for v in (cand_name, cand_name.upper(), cand_name.lower()):
+            if v not in seen:
+                variants.append(v)
+                seen.add(v)
         cand_path = None
         for v in variants:
             full = os.path.join(dirname, v)
-            if os.path.exists(full):
+            if os.path.exists(full) and os.path.abspath(full) != first_path_abs:
                 cand_path = full
                 break
         if cand_path is None:
             break
         d = open_disk_file(cand_path)
-        if d["disknum"] != idx:
-            print(f"WARNING: {cand_path} reports disknum={d['disknum']}, expected {idx}; using anyway")
+        expected_disknum = len(disks)   # we have N disks so far; next should be #N
+        if d["disknum"] != expected_disknum:
+            print(f"WARNING: {cand_path} reports disknum={d['disknum']}, expected {expected_disknum}; using anyway")
         disks.append(d)
-        idx += 1
+        fname_idx += 1
     return disks
 
 
