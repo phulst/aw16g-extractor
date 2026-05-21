@@ -2,26 +2,31 @@
 """
 AW16G backup extractor.
 
-Reads a Yamaha AW16G .16G backup file and writes one mono 16-bit WAV per track
-for every song that fits inside this disk image.
+Reads a Yamaha AW16G .16G backup file (or set of files for a multi-disk
+backup) and writes one mono 16-bit WAV per virtual track, organised under
+out_dir/<song-name>/.
 
 This is a from-scratch reimplementation of the file-format walking logic from
-Jeff Leary's AWare-Audio (Tcl), fixed for two issues that prevented it from
-working on this particular backup:
+Jeff Leary's AWare-Audio (Tcl), with three differences:
 
-  1. The original assumes the user songs occupy a contiguous run of entries
-     in the song-info table starting from the entry whose "offset" field is
-     zero. In real backups, user songs can be sparsely scattered through the
-     1000-entry table - we have to scan the whole table and pick the entries
-     whose computed song-block location lands inside the file.
-  2. The original has no guard against song locations computed past EOF, so
-     a multi-disk backup with disks missing crashes inside binary scan.
-
-Output: one WAV file per non-empty virtual track, organised under
-out_dir/<song-name>/.
+  1. Robust song-info walk: the AWare-Audio AW16G code path assumes user
+     songs occupy a contiguous run of entries in the 1000-entry song-info
+     table starting from the entry whose "offset" field is zero. In real
+     backups they're sparsely scattered (factory presets and stale slots
+     interleave), so we scan the whole table and keep entries whose computed
+     song-block location lands inside the file and has a plausible track
+     header.
+  2. Correct audio-frame base for songs after the first: AWare-Audio bases
+     frame offsets on the song's metadata location, which is right only for
+     song 0. We use the fixed SONGBLOCK_LOCATION constant instead.
+  3. Multi-disk support: pass any disk's path and we auto-discover sibling
+     files (AW_00000.16G, AW_00001.16G, ...). Each audio-frame read is
+     routed to the disk that holds the frame based on the disk-info header
+     fields (previous_frames, offset_frames, max_frames).
 """
 
 import os
+import re
 import struct
 import sys
 import wave
@@ -95,6 +100,8 @@ def read_at(fh, offset, length):
 
 
 def parse_disk_header(fh, file_size):
+    """Lightweight header parse — used to print a summary line. Returns
+    (songcount, disknum). For full multi-disk header parsing, see open_disk_file."""
     buf = read_at(fh, DISKINFO_LOCATION, 256)
     if not buf.startswith(DISKINFO_SIG):
         raise SystemExit(f"Not a CFS/16G file - signature at 0x{DISKINFO_LOCATION:x} was {buf[:4]!r}")
@@ -102,6 +109,98 @@ def parse_disk_header(fh, file_size):
     disknum   = u8(buf, DISKINFO_DISKNUM_OFFSET)
     print(f"Disk header: signature={buf[:8]!r}  disk_number={disknum}  songcount={songcount}")
     return songcount, disknum
+
+
+# ---- multi-disk handling ---------------------------------------------------
+
+DISKINFO_MAXFRAMES_OFFSET = 0x2a   # s16 BE
+DISKINFO_PREVFRAMES_OFFSET = 0x2c  # s16 BE -- -1 means "this isn't disk 0"
+DISKINFO_OFFSETFRAMES_OFFSET = 0x2e  # s16 BE
+
+
+def open_disk_file(path):
+    """Open one .16G file and read its disk header.
+    Returns a dict describing the disk."""
+    fh = open(path, "rb")
+    sz = os.path.getsize(path)
+    fh.seek(DISKINFO_LOCATION)
+    hdr = fh.read(256)
+    if not hdr.startswith(DISKINFO_SIG):
+        fh.close()
+        raise SystemExit(f"{path}: bad CFS signature at 0x{DISKINFO_LOCATION:x}")
+    songcount  = u16(hdr, DISKINFO_SONGCOUNT_OFFSET)
+    disknum    = u8(hdr, DISKINFO_DISKNUM_OFFSET)
+    max_frames = struct.unpack(">h", hdr[DISKINFO_MAXFRAMES_OFFSET:DISKINFO_MAXFRAMES_OFFSET+2])[0]
+    prev_fr    = struct.unpack(">h", hdr[DISKINFO_PREVFRAMES_OFFSET:DISKINFO_PREVFRAMES_OFFSET+2])[0]
+    off_fr     = struct.unpack(">h", hdr[DISKINFO_OFFSETFRAMES_OFFSET:DISKINFO_OFFSETFRAMES_OFFSET+2])[0]
+    # Audio data base. On disk 0 it's the fixed SONGBLOCK_LOCATION (audio sits
+    # after the song-info table). On disks >=1 there's no song-info table, so
+    # the audio fills the tail of the file: base = file_size - max_frames*BLOCK_SIZE.
+    if disknum == 0:
+        audio_base = SONGBLOCK_LOCATION
+    else:
+        audio_base = sz - max_frames * BLOCK_SIZE
+    return {
+        "path":            path,
+        "fh":              fh,
+        "size":            sz,
+        "disknum":         disknum,
+        "songcount":       songcount,
+        "max_frames":      max_frames,
+        "previous_frames": prev_fr,
+        "offset_frames":   off_fr,
+        "audio_base":      audio_base,
+    }
+
+
+def open_disks(first_path):
+    """Open the given .16G plus any sibling disks (incrementing numeric suffix).
+    Returns a list of disk dicts in [disk 0, disk 1, ...] order.
+
+    The AW-16G names backup files like AW_00000.16G, AW_00001.16G, ... so we
+    look for the numeric suffix in the input filename and probe for siblings
+    with each integer incremented. macOS case-insensitivity is handled by
+    trying a few common case variants."""
+    disks = [open_disk_file(first_path)]
+    if disks[0]["disknum"] != 0:
+        return disks
+    dirname  = os.path.dirname(first_path) or "."
+    basename = os.path.basename(first_path)
+    name, ext = os.path.splitext(basename)
+    m = re.search(r"(\d+)$", name)
+    if not m:
+        return disks
+    prefix, digits = name[:m.start()], m.end() - m.start()
+    idx = 1
+    while True:
+        cand_name = f"{prefix}{idx:0{digits}d}{ext}"
+        variants = {cand_name, cand_name.upper(), cand_name.lower()}
+        cand_path = None
+        for v in variants:
+            full = os.path.join(dirname, v)
+            if os.path.exists(full):
+                cand_path = full
+                break
+        if cand_path is None:
+            break
+        d = open_disk_file(cand_path)
+        if d["disknum"] != idx:
+            print(f"WARNING: {cand_path} reports disknum={d['disknum']}, expected {idx}; using anyway")
+        disks.append(d)
+        idx += 1
+    return disks
+
+
+def find_frame_on_disks(disks, global_frame):
+    """Locate the (disk, file_offset) for a global audio-frame number, or
+    None if no disk in the set holds that frame."""
+    for d in disks:
+        adj = global_frame + (d["offset_frames"] if d["previous_frames"] == -1 else 0)
+        if 0 <= adj < d["max_frames"]:
+            off = d["audio_base"] + adj * BLOCK_SIZE
+            if off + BLOCK_SIZE <= d["size"]:
+                return d, off
+    return None
 
 
 def find_songs(fh, file_size, expected_count):
@@ -171,10 +270,15 @@ def read_map_entry(fh, song_loc, map_id):
     }
 
 
-def extract_track_pcm(fh, song_loc, track, file_size):
+def extract_track_pcm(disks, song_loc, track):
     """Walk a track's region list and frame map. Returns (pcm_le_bytes,
-    truncated) where truncated is True if any audio frame would have been read
-    past EOF (i.e. lives on a missing disk)."""
+    truncated). truncated is True if any audio frame referenced by this track
+    is not present on any of the disks we have.
+
+    `disks` is a list of disk dicts from open_disks(). Metadata (regions,
+    maps) is read from disks[0]; audio frames are routed to the disk that
+    holds them via find_frame_on_disks()."""
+    fh0 = disks[0]["fh"]
     bits = 16
     sample_bytes = bits // 8
     out = bytearray()
@@ -183,7 +287,7 @@ def extract_track_pcm(fh, song_loc, track, file_size):
 
     region_ptr = track["region_ptr"]
     while region_ptr < BLOCK_TERM:
-        region = read_region(fh, song_loc, region_ptr)
+        region = read_region(fh0, song_loc, region_ptr)
         if region["total_samples"] == 0 or region["start_sample"] < 0:
             region_ptr = region["next_region"]
             continue
@@ -204,18 +308,17 @@ def extract_track_pcm(fh, song_loc, track, file_size):
         samples_written_in_region = 0
         first_frame = True
         map_ptr = region["map_ptr"]
-        # We also need to know if this is the LAST frame in the region to
-        # clip overshoot. We peek next.
         while map_ptr < BLOCK_TERM:
-            entry = read_map_entry(fh, song_loc, map_ptr)
+            entry = read_map_entry(fh0, song_loc, map_ptr)
             audio_frame = entry["audio_frame"]
-            # Audio frames are indexed from songblock_location (the start of
-            # the disk's audio area), NOT from each song's metadata location.
-            # For song 0 the two are equal because its metadata sits at the
-            # start of the audio area, but for songs 1+ they diverge.
-            frame_loc = SONGBLOCK_LOCATION + audio_frame * BLOCK_SIZE
-            frame_size = BLOCK_SIZE
             is_last_frame_in_region = entry["next_map"] >= BLOCK_TERM
+
+            located = find_frame_on_disks(disks, audio_frame)
+            if located is None:
+                truncated = True
+                break
+            disk, frame_loc = located
+            frame_size = BLOCK_SIZE
 
             if first_frame:
                 # Skip past the offset-samples worth of header at the start of
@@ -236,14 +339,12 @@ def extract_track_pcm(fh, song_loc, track, file_size):
                     frame_size = remaining_bytes
 
             if frame_size > 0:
-                # Ensure even sample count
                 frame_size -= frame_size % sample_bytes
-                if frame_loc + frame_size > file_size:
+                if frame_loc + frame_size > disk["size"]:
                     truncated = True
                     break
-                pcm_be = read_at(fh, frame_loc, frame_size)
+                pcm_be = read_at(disk["fh"], frame_loc, frame_size)
                 if len(pcm_be) < frame_size:
-                    # we ran out of file - stop cleanly
                     truncated = True
                     break
                 # AW stores big-endian; WAV wants little-endian. Byteswap.
@@ -279,12 +380,21 @@ def main():
         sys.exit(1)
     src = sys.argv[1]
     out_dir = sys.argv[2] if len(sys.argv) > 2 else "extracted"
-    file_size = os.path.getsize(src)
     os.makedirs(out_dir, exist_ok=True)
 
-    with open(src, "rb") as fh:
-        songcount, _ = parse_disk_header(fh, file_size)
-        songs = find_songs(fh, file_size, songcount)
+    disks = open_disks(src)
+    fh0   = disks[0]["fh"]
+    sz0   = disks[0]["size"]
+    print(f"Opened {len(disks)} disk file(s):")
+    for d in disks:
+        print(f"  disk {d['disknum']}: {os.path.basename(d['path'])}  size={d['size']:,}  "
+              f"max_frames={d['max_frames']}  prev={d['previous_frames']}  off={d['offset_frames']}  "
+              f"audio_base=0x{d['audio_base']:x}")
+    print()
+
+    try:
+        songcount, _ = parse_disk_header(fh0, sz0)
+        songs = find_songs(fh0, sz0, songcount)
 
         any_missing = False
         used_dirs_lower = set()
@@ -305,11 +415,11 @@ def main():
                 print(f"\n>> Song '{song['name']}' at 0x{song['location']:08x}  -> {candidate!r} (name collision)")
             else:
                 print(f"\n>> Song '{song['name']}' at 0x{song['location']:08x}")
-            tracks = parse_tracks(fh, song["location"])
+            tracks = parse_tracks(fh0, song["location"])
             print(f"   {len(tracks)} valid track(s)")
             song_truncated = False
             for tr in tracks:
-                pcm, truncated = extract_track_pcm(fh, song["location"], tr, file_size)
+                pcm, truncated = extract_track_pcm(disks, song["location"], tr)
                 samples = len(pcm) // 2
                 secs = samples / 44100
                 fname = f"{tr['index']:03d}_{tr['name']}.wav"
@@ -326,12 +436,16 @@ def main():
                 any_missing = True
 
         if any_missing:
+            next_idx = max(d["disknum"] for d in disks) + 1
             print(
-                "\nNOTE: This .16G appears to be the first disk of a multi-disk backup.\n"
-                "      Songs whose audio lies past the end of this file need the\n"
-                "      subsequent disks (AW_00001.16G, AW_00002.16G, ...) to be\n"
-                "      extracted fully."
+                f"\nNOTE: Some songs reference audio frames that aren't on any of the\n"
+                f"      {len(disks)} disk file(s) we have. This backup probably continues\n"
+                f"      onto disk {next_idx} (AW_{next_idx:05d}.16G). Put that file next\n"
+                f"      to disk 0 and re-run to finish extracting the truncated tracks."
             )
+    finally:
+        for d in disks:
+            d["fh"].close()
 
     print("\nDone.")
 

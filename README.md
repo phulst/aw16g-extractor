@@ -83,20 +83,28 @@ at sample 0.
 ## Multi-disk backups
 
 CD-spanning backups produce a numbered sequence (`AW_00000.16G`,
-`AW_00001.16G`, …). This script reads only the file you point it at. When a
-song's audio frames reference data past EOF, you'll see:
+`AW_00001.16G`, …). Just point the script at disk 0 and put the other disk
+files alongside it — sibling files are auto-discovered by filename pattern.
+At startup you'll see one line per disk:
 
 ```
-skip  000_V_TR01_1.wav  (no audio on this disk)  [TRUNCATED -- needs next disk]
+Opened 2 disk file(s):
+  disk 0: aw_00000.16g  size=736,843,776  max_frames=5621  prev=0  off=41  ...
+  disk 1: aw_00001.16g  size=24,467,456   max_frames=186   prev=-1 off=-5579 ...
 ```
 
-The song's *metadata* (name, tracks, region pointers) is recovered, but the
-audio itself lives on a later disk. Multi-disk support would need a small
-extension to follow frame numbers across files. PRs welcome.
+Each audio-frame read is routed to the disk that holds it based on each
+disk's header fields (`previous_frames`, `offset_frames`, `max_frames`).
+On disk 0 the audio data sits at the fixed `0x515800` offset; on disks ≥1
+it fills the tail of the file (base = `file_size - max_frames*0x20000`,
+which is `0x15800` for a full CD).
+
+If a song still references frames not present in the disks you supplied,
+you'll see `[TRUNCATED -- needs next disk]` next to that track and a hint
+about which disk number is missing.
 
 ## Limitations
 
-- Single-disk only (see above).
 - No 24-bit support. The AW-16G is a 16-bit machine; the related AW4416 /
   AW2816 can do 24-bit but those models aren't handled here — use
   AWare-Audio for those.
