@@ -106,8 +106,18 @@ extension to follow frame numbers across files. PRs welcome.
 
 - **[AWare-Audio](https://github.com/jeffleary00/AWare-Audio)** by Jeff Leary
   — the source of all the format constants and the original walking
-  algorithm. This project is essentially a Python reimplementation with two
-  bugs fixed.
+  algorithm. This project is essentially a Python reimplementation with
+  three bugs fixed:
+    1. The AW16G song-info walk; see the "AWare-Audio bugs" section above.
+    2. The audio-frame base address for songs other than the first. The
+       upstream tool computes `frame_loc = song_metadata_loc + frame *
+       block_size`, which gives the wrong answer for the second and later
+       songs in a multi-song single-disk backup (their `song_metadata_loc`
+       isn't the start of the audio area). The correct base is the fixed
+       `songblock_location` constant. For song 0 the two coincide, which
+       is why the bug went unnoticed.
+    3. (Same area as bug 1.) Bounds-checking on the computed song-block
+       location.
 
 ## License
 

@@ -209,7 +209,11 @@ def extract_track_pcm(fh, song_loc, track, file_size):
         while map_ptr < BLOCK_TERM:
             entry = read_map_entry(fh, song_loc, map_ptr)
             audio_frame = entry["audio_frame"]
-            frame_loc = song_loc + audio_frame * BLOCK_SIZE
+            # Audio frames are indexed from songblock_location (the start of
+            # the disk's audio area), NOT from each song's metadata location.
+            # For song 0 the two are equal because its metadata sits at the
+            # start of the audio area, but for songs 1+ they diverge.
+            frame_loc = SONGBLOCK_LOCATION + audio_frame * BLOCK_SIZE
             frame_size = BLOCK_SIZE
             is_last_frame_in_region = entry["next_map"] >= BLOCK_TERM
 
