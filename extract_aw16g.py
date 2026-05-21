@@ -287,10 +287,24 @@ def main():
         songs = find_songs(fh, file_size, songcount)
 
         any_missing = False
+        used_dirs_lower = set()
         for song in songs:
-            song_dir = os.path.join(out_dir, song["name"])
+            # Disambiguate names that would collide on a case-insensitive
+            # filesystem (e.g. two songs named "Amber alert" and "AMBER ALERT"
+            # would both write into the same folder on macOS).
+            base = song["name"]
+            candidate = base
+            n = 2
+            while candidate.lower() in used_dirs_lower:
+                candidate = f"{base} ({n})"
+                n += 1
+            used_dirs_lower.add(candidate.lower())
+            song_dir = os.path.join(out_dir, candidate)
             os.makedirs(song_dir, exist_ok=True)
-            print(f"\n>> Song '{song['name']}' at 0x{song['location']:08x}")
+            if candidate != base:
+                print(f"\n>> Song '{song['name']}' at 0x{song['location']:08x}  -> {candidate!r} (name collision)")
+            else:
+                print(f"\n>> Song '{song['name']}' at 0x{song['location']:08x}")
             tracks = parse_tracks(fh, song["location"])
             print(f"   {len(tracks)} valid track(s)")
             song_truncated = False
